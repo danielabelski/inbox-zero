@@ -64,6 +64,15 @@ describe("processAttachment", () => {
       wasAsked: data.wasAsked,
       folderPath: data.folderPath,
     }));
+    prisma.documentFiling.update.mockImplementation(
+      async ({ data, where }: any) => ({
+        id: where.id,
+        status: data.status,
+        wasAsked: data.wasAsked,
+        folderPath: data.folderPath,
+      }),
+    );
+    prisma.documentFiling.findFirst.mockResolvedValue(null);
 
     vi.mocked(extractTextFromDocument).mockResolvedValue({
       text: "Quarterly invoice",
@@ -143,6 +152,87 @@ describe("processAttachment", () => {
         userEmail: "user@test.com",
       }),
     );
+  });
+
+  it("does not upload an attachment that already has a filing record", async () => {
+    prisma.documentFiling.findFirst.mockResolvedValue({
+      id: "filing-existing",
+      filename: "invoice.pdf",
+      folderPath: "Invoices",
+      fileId: "drive-file-existing",
+      status: "FILED",
+      wasAsked: false,
+      confidence: 0.95,
+      reasoning: "Already filed",
+      driveConnection: { provider: "google" },
+    } as any);
+    const { attachment, emailAccount, emailProvider, message, uploadFile } =
+      setupSuccessfulFiling({
+        confidence: 0.95,
+      });
+
+    const result = await processAttachment({
+      attachment,
+      emailAccount,
+      emailProvider,
+      logger,
+      message,
+    });
+
+    expect(result).toEqual({
+      success: true,
+      filing: {
+        id: "filing-existing",
+        filename: "invoice.pdf",
+        folderPath: "Invoices",
+        fileId: "drive-file-existing",
+        wasAsked: false,
+        confidence: 0.95,
+        provider: "google",
+      },
+      filingId: "filing-existing",
+    });
+    expect(emailProvider.getAttachment).not.toHaveBeenCalled();
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(analyzeDocument).not.toHaveBeenCalled();
+  });
+
+  it("retries an error filing record without creating a duplicate row", async () => {
+    prisma.documentFiling.findFirst.mockResolvedValue({
+      id: "filing-error",
+      filename: "invoice.pdf",
+      folderPath: "Invoices",
+      fileId: null,
+      status: "ERROR",
+      wasAsked: false,
+      confidence: null,
+      reasoning: "Previous attempt failed",
+      driveConnection: { provider: "google" },
+    } as any);
+    const { attachment, emailAccount, emailProvider, message, uploadFile } =
+      setupSuccessfulFiling({
+        confidence: 0.95,
+      });
+
+    const result = await processAttachment({
+      attachment,
+      emailAccount,
+      emailProvider,
+      logger,
+      message,
+    });
+
+    expect(result.success).toBe(true);
+    expect(uploadFile).toHaveBeenCalled();
+    expect(analyzeDocument).toHaveBeenCalled();
+    expect(prisma.documentFiling.create).not.toHaveBeenCalled();
+    expect(prisma.documentFiling.update).toHaveBeenCalledWith({
+      where: { id: "filing-error" },
+      data: expect.objectContaining({
+        status: "FILED",
+        fileId: "drive-file-1",
+      }),
+    });
   });
 });
 

@@ -85,6 +85,67 @@ export async function processAttachment({
       return { success: false, error: "Filing not enabled" };
     }
 
+    const existingFiling = await prisma.documentFiling.findFirst({
+      where: {
+        emailAccountId: emailAccount.id,
+        messageId: message.id,
+        attachmentId: attachment.attachmentId,
+      },
+      select: {
+        id: true,
+        filename: true,
+        folderPath: true,
+        fileId: true,
+        status: true,
+        wasAsked: true,
+        confidence: true,
+        reasoning: true,
+        driveConnection: {
+          select: {
+            provider: true,
+          },
+        },
+      },
+    });
+
+    let retryFilingId: string | null = null;
+    if (existingFiling) {
+      log.info("Attachment already has a filing record", {
+        filingId: existingFiling.id,
+        status: existingFiling.status,
+      });
+
+      if (existingFiling.status === "ERROR") {
+        log.info("Retrying attachment after previous filing error", {
+          filingId: existingFiling.id,
+        });
+        retryFilingId = existingFiling.id;
+      } else if (existingFiling.status === "PREVIEW") {
+        return {
+          success: false,
+          skipped: true,
+          skipReason:
+            existingFiling.reasoning ||
+            "Document doesn't match filing preferences",
+          filingId: existingFiling.id,
+        };
+      } else {
+        return {
+          success: true,
+          filing: {
+            id: existingFiling.id,
+            filename: existingFiling.filename,
+            folderPath: existingFiling.folderPath,
+            fileId: existingFiling.fileId,
+            wasAsked: existingFiling.wasAsked,
+            confidence: existingFiling.confidence,
+            provider: existingFiling.driveConnection.provider,
+          },
+          filingId: existingFiling.id,
+        };
+      }
+    }
+
     // Get all connected drives
     const driveConnections = await prisma.driveConnection.findMany({
       where: {
@@ -169,20 +230,23 @@ export async function processAttachment({
     if (analysis.action === "skip") {
       log.info("AI decided to skip this document");
 
-      // Create a DocumentFiling record for skipped items (for audit trail and feedback)
-      const skipFiling = await prisma.documentFiling.create({
-        data: {
-          messageId: message.id,
-          attachmentId: attachment.attachmentId,
-          filename: attachment.filename,
-          folderPath: "",
-          status: "PREVIEW", // PREVIEW = AI decided to skip (not user rejection)
-          reasoning: analysis.reasoning,
-          confidence: analysis.confidence,
-          driveConnectionId: driveConnections[0].id,
-          emailAccountId: emailAccount.id,
-        },
-      });
+      const skipFilingData = {
+        messageId: message.id,
+        attachmentId: attachment.attachmentId,
+        filename: attachment.filename,
+        folderPath: "",
+        status: "PREVIEW" as const, // PREVIEW = AI decided to skip (not user rejection)
+        reasoning: analysis.reasoning,
+        confidence: analysis.confidence,
+        driveConnectionId: driveConnections[0].id,
+        emailAccountId: emailAccount.id,
+      };
+      const skipFiling = retryFilingId
+        ? await prisma.documentFiling.update({
+            where: { id: retryFilingId },
+            data: skipFilingData,
+          })
+        : await prisma.documentFiling.create({ data: skipFilingData });
 
       log.info("Skip record created", { filingId: skipFiling.id });
 
@@ -238,23 +302,27 @@ export async function processAttachment({
       fileId = uploadedFile.id;
     }
 
-    // Step 9: Create DocumentFiling record
-    const filing = await prisma.documentFiling.create({
-      data: {
-        messageId: message.id,
-        attachmentId: attachment.attachmentId,
-        filename: attachment.filename,
-        folderId: targetFolderId,
-        folderPath: targetFolderPath,
-        fileId,
-        reasoning: analysis.reasoning,
-        confidence: analysis.confidence,
-        status: shouldAsk ? "PENDING" : "FILED",
-        wasAsked: shouldAsk,
-        driveConnectionId: driveConnection.id,
-        emailAccountId: emailAccount.id,
-      },
-    });
+    // Step 9: Create or replace DocumentFiling record
+    const filingData = {
+      messageId: message.id,
+      attachmentId: attachment.attachmentId,
+      filename: attachment.filename,
+      folderId: targetFolderId,
+      folderPath: targetFolderPath,
+      fileId,
+      reasoning: analysis.reasoning,
+      confidence: analysis.confidence,
+      status: shouldAsk ? ("PENDING" as const) : ("FILED" as const),
+      wasAsked: shouldAsk,
+      driveConnectionId: driveConnection.id,
+      emailAccountId: emailAccount.id,
+    };
+    const filing = retryFilingId
+      ? await prisma.documentFiling.update({
+          where: { id: retryFilingId },
+          data: filingData,
+        })
+      : await prisma.documentFiling.create({ data: filingData });
 
     log.info("Filing record created", {
       filingId: filing.id,
