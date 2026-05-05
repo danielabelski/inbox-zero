@@ -60,6 +60,10 @@ import {
   type PromptHardening,
 } from "@/utils/ai/security";
 import {
+  enforceSensitiveDataPolicy,
+  redactSensitiveContentForLogging,
+} from "@/utils/llms/sensitive-content";
+import {
   extractLLMErrorInfo,
   isTransientNetworkError,
   withNetworkRetry,
@@ -101,6 +105,12 @@ type UsageMetadata = {
   stepCount?: number;
   toolCallCount?: number;
 };
+type LlmEmailAccount = {
+  sensitiveDataPolicy?: EmailAccountWithAI["sensitiveDataPolicy"];
+  email: EmailAccountWithAI["email"];
+  id: EmailAccountWithAI["id"];
+  userId: EmailAccountWithAI["userId"];
+};
 
 export type ToolCallAgentResolvedModel = {
   excludedTools: string[];
@@ -123,7 +133,7 @@ export function createGenerateText({
   promptHardening,
   onModelUsed,
 }: {
-  emailAccount: Pick<EmailAccountWithAI, "email" | "id" | "userId">;
+  emailAccount: LlmEmailAccount;
   label: string;
   modelOptions: ReturnType<typeof getModel>;
   promptHardening: PromptHardening;
@@ -148,12 +158,28 @@ export function createGenerateText({
         system: typeof options.system === "string" ? options.system : undefined,
         promptHardening,
       });
+      const protectedOptions = enforceSensitiveDataPolicy({
+        options: { ...options, system: systemText },
+        policy: emailAccount.sensitiveDataPolicy,
+        logger,
+        label,
+        userId: emailAccount.userId,
+        emailAccountId: emailAccount.id,
+      });
 
       logger.trace("Generating text", {
         label,
         promptHardening,
-        system: systemText?.slice(0, MAX_LOG_LENGTH),
-        prompt: options.prompt?.slice(0, MAX_LOG_LENGTH),
+        system: redactSensitiveContentForLogging(
+          typeof protectedOptions.system === "string"
+            ? protectedOptions.system
+            : undefined,
+        )?.slice(0, MAX_LOG_LENGTH),
+        prompt: redactSensitiveContentForLogging(
+          typeof protectedOptions.prompt === "string"
+            ? protectedOptions.prompt
+            : undefined,
+        )?.slice(0, MAX_LOG_LENGTH),
       });
 
       const providerOptions = buildProviderOptions({
@@ -172,8 +198,7 @@ export function createGenerateText({
 
       const result = await generateText(
         {
-          ...options,
-          system: systemText,
+          ...protectedOptions,
           ...commonOptions,
           providerOptions,
           model: withPosthogTracing({
@@ -228,6 +253,8 @@ export function createGenerateText({
           { label },
         );
       } catch (error) {
+        if (error instanceof SafeError) throw error;
+
         if (nextCandidate && shouldFallbackToNextModel(error)) {
           logger.warn("LLM call failed, trying fallback model", {
             label,
@@ -264,7 +291,7 @@ export function createGenerateObject({
   promptHardening,
   onModelUsed,
 }: {
-  emailAccount: Pick<EmailAccountWithAI, "email" | "id" | "userId">;
+  emailAccount: LlmEmailAccount;
   label: string;
   modelOptions: ReturnType<typeof getModel>;
   promptHardening: PromptHardening;
@@ -301,18 +328,40 @@ export function createGenerateObject({
         system: typeof options.system === "string" ? options.system : undefined,
         promptHardening,
       });
+      const protectedOptions = enforceSensitiveDataPolicy({
+        options: { ...options, system: systemText },
+        policy: emailAccount.sensitiveDataPolicy,
+        logger,
+        label,
+        userId: emailAccount.userId,
+        emailAccountId: emailAccount.id,
+      });
 
       logger.trace("Generating object", {
         label,
         promptHardening,
-        system: systemText?.slice(0, MAX_LOG_LENGTH),
-        prompt: options.prompt?.slice(0, MAX_LOG_LENGTH),
+        system: redactSensitiveContentForLogging(
+          typeof protectedOptions.system === "string"
+            ? protectedOptions.system
+            : undefined,
+        )?.slice(0, MAX_LOG_LENGTH),
+        prompt: redactSensitiveContentForLogging(
+          typeof protectedOptions.prompt === "string"
+            ? protectedOptions.prompt
+            : undefined,
+        )?.slice(0, MAX_LOG_LENGTH),
       });
 
+      // Only warn for prompt-shaped calls. Messages-shaped callers (no
+      // `prompt` string) are out of scope; scanning every message for
+      // the literal "JSON" would be brittle and noisy.
+      const systemIncludesJson =
+        typeof protectedOptions.system === "string" &&
+        protectedOptions.system.includes("JSON");
       if (
-        !systemText?.includes("JSON") &&
-        typeof options.prompt === "string" &&
-        !options.prompt?.includes("JSON")
+        !systemIncludesJson &&
+        typeof protectedOptions.prompt === "string" &&
+        !protectedOptions.prompt.includes("JSON")
       ) {
         logger.warn("Missing JSON in prompt", { label });
       }
@@ -338,8 +387,7 @@ export function createGenerateObject({
           latestRepairAttempt = repairResult.attempt;
           return repairResult.text;
         },
-        ...options,
-        system: systemText,
+        ...protectedOptions,
         ...commonOptions,
         providerOptions,
         model: withPosthogTracing({
@@ -401,6 +449,8 @@ export function createGenerateObject({
           { label },
         );
       } catch (error) {
+        if (error instanceof SafeError) throw error;
+
         attachLlmRepairMetadata(
           error,
           buildRepairMetadata({
@@ -452,6 +502,7 @@ export async function chatCompletionStream({
   userEmail,
   usageLabel: label,
   providerOptions: requestProviderOptions,
+  sensitiveDataPolicy,
   onFinish,
   onStepFinish,
 }: {
@@ -466,6 +517,7 @@ export async function chatCompletionStream({
   userEmail: string;
   usageLabel: string;
   providerOptions?: LLMProviderOptions;
+  sensitiveDataPolicy?: string | null;
   onFinish?: StreamTextOnFinishCallback<Record<string, Tool>>;
   onStepFinish?: StreamTextOnStepFinishCallback<Record<string, Tool>>;
 }) {
@@ -480,6 +532,14 @@ export async function chatCompletionStream({
     messages,
     promptHardening,
   });
+  const protectedMessages = enforceSensitiveDataPolicy({
+    options: { messages: hardenedMessages },
+    policy: sensitiveDataPolicy,
+    logger,
+    label,
+    userId,
+    emailAccountId,
+  }).messages;
 
   for (let index = 0; index < modelCandidates.length; index++) {
     const candidate = modelCandidates[index];
@@ -508,7 +568,7 @@ export async function chatCompletionStream({
     try {
       return streamText({
         model,
-        messages: hardenedMessages,
+        messages: protectedMessages as ModelMessage[],
         tools,
         stopWhen: maxSteps ? stepCountIs(maxSteps) : undefined,
         ...commonOptions,
@@ -602,6 +662,7 @@ export async function toolCallAgentStream({
   onFinish,
   onStepFinish,
   onModelResolved,
+  sensitiveDataPolicy,
   temperature,
 }: {
   userAi: UserAIFields;
@@ -620,6 +681,7 @@ export async function toolCallAgentStream({
   onFinish?: StreamTextOnFinishCallback<Record<string, Tool>>;
   onStepFinish?: StreamTextOnStepFinishCallback<Record<string, Tool>>;
   onModelResolved?: (resolvedModel: ToolCallAgentResolvedModel) => void;
+  sensitiveDataPolicy?: string | null;
   temperature?: number;
 }) {
   const { modelOptions, modelCandidates } = await resolveModelCandidates({
@@ -633,6 +695,14 @@ export async function toolCallAgentStream({
     messages,
     promptHardening,
   });
+  const protectedMessages = enforceSensitiveDataPolicy({
+    options: { messages: hardenedMessages },
+    policy: sensitiveDataPolicy,
+    logger,
+    label,
+    userId,
+    emailAccountId,
+  }).messages;
 
   for (let index = 0; index < modelCandidates.length; index++) {
     const candidate = modelCandidates[index];
@@ -733,7 +803,7 @@ export async function toolCallAgentStream({
 
     try {
       return await agent.stream({
-        messages: hardenedMessages,
+        messages: protectedMessages as ModelMessage[],
         experimental_transform: smoothStream({ chunking: "word" }),
         onStepFinish: onStepFinish
           ? async (stepResult) => {

@@ -3,6 +3,7 @@
 import { actionClient } from "@/utils/actions/safe-action";
 import {
   saveAiSettingsBody,
+  saveSensitiveDataPolicyBody,
   saveEmailUpdateSettingsBody,
   saveDigestScheduleBody,
   updateDigestItemsBody,
@@ -21,6 +22,7 @@ import { clearSpecificErrorMessages, ErrorType } from "@/utils/error-messages";
 import { SafeError } from "@/utils/error";
 import { env } from "@/env";
 import { addActionOwnershipToInput } from "@/utils/rule/rule";
+import { isSensitiveDataPolicyLocked } from "@/utils/dlp/policy.server";
 
 export const updateEmailSettingsAction = actionClient
   .metadata({ name: "updateEmailSettings" })
@@ -102,6 +104,27 @@ export const updateAiSettingsAction = actionClientUser
           ErrorType.ANTHROPIC_INSUFFICIENT_BALANCE,
         ],
         logger,
+      });
+    },
+  );
+
+export const updateSensitiveDataPolicyAction = actionClient
+  .metadata({ name: "updateSensitiveDataPolicy" })
+  .inputSchema(saveSensitiveDataPolicyBody)
+  .action(
+    async ({
+      ctx: { emailAccountId },
+      parsedInput: { sensitiveDataPolicy },
+    }) => {
+      if (isSensitiveDataPolicyLocked()) {
+        throw new SafeError(
+          "Sensitive data protection is managed by the deployment.",
+        );
+      }
+
+      await prisma.emailAccount.update({
+        where: { id: emailAccountId },
+        data: { sensitiveDataPolicy },
       });
     },
   );
